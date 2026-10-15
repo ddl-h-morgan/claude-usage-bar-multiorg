@@ -129,11 +129,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Initial guess; SwiftUI's intrinsic size (capped at 600) will drive the actual size.
         p.contentSize = NSSize(width: 360, height: 320)
         p.behavior = .transient
-        p.contentViewController = NSHostingController(rootView: UsageView(
+        let host = NSHostingController(rootView: UsageView(
             usageManager: usageManager,
             statusManager: statusManager,
             updateManager: updateManager
         ))
+        // Let the SwiftUI content's fitting size drive the popover size; otherwise it stays at
+        // the initial guess above and taller content (e.g. several orgs) clips off the top.
+        if #available(macOS 13.0, *) {
+            host.sizingOptions = [.preferredContentSize]
+        }
+        p.contentViewController = host
         return p
     }
 
