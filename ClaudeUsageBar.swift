@@ -447,8 +447,12 @@ struct OrgUsage: Equatable {
     var weekly: UsageWindow?
     var weeklySonnet: UsageWindow?
     var weeklyFable: UsageWindow?
+    // Org-wide budget (from overage_spend_limit): shared by everyone in the org.
     var extraSpentMinor = 0
     var extraLimitMinor = 0
+    // The signed-in member's own spend and cap (from /usage `extra_usage`).
+    var memberSpentMinor = 0
+    var memberLimitMinor = 0
     var extraResetsAt: Date?
     var freeCreditsMinor = 0
     var currency = "USD"
@@ -457,6 +461,7 @@ struct OrgUsage: Equatable {
     var error: String?
 
     var hasCreditUsage: Bool { extraSpentMinor > 0 }
+    var hasMemberSpend: Bool { memberSpentMinor > 0 || memberLimitMinor > 0 }
     var hasAnyWindow: Bool { session != nil || weekly != nil || weeklySonnet != nil || weeklyFable != nil }
 }
 
@@ -887,6 +892,13 @@ class UsageManager: ObservableObject {
         usage.weekly = window(json["seven_day"])
         usage.weeklySonnet = window(json["seven_day_sonnet"])
         usage.weeklyFable = nil
+        usage.memberSpentMinor = 0
+        usage.memberLimitMinor = 0
+        if let eu = json["extra_usage"] as? [String: Any], (eu["is_enabled"] as? Bool) != false {
+            usage.memberSpentMinor = (eu["used_credits"] as? NSNumber)?.intValue ?? 0
+            usage.memberLimitMinor = (eu["monthly_limit"] as? NSNumber)?.intValue ?? 0
+            if let cur = eu["currency"] as? String { usage.currency = cur }
+        }
         if let limits = json["limits"] as? [[String: Any]] {
             let fable = limits.first { entry in
                 let model = (entry["scope"] as? [String: Any])?["model"] as? [String: Any]
@@ -2222,7 +2234,7 @@ struct UsageView: View {
                 // Fable is only surfaced once usage is above 1% (new model, counted separately).
                 if let w = org.weeklyFable, w.percent >= 1 { usageRow("Weekly Fable (7 day)", w, includeDate: true) }
 
-                if !org.hasAnyWindow && !org.hasCreditUsage && org.freeCreditsMinor == 0 {
+                if !org.hasAnyWindow && !org.hasMemberSpend && !org.hasCreditUsage && org.freeCreditsMinor == 0 {
                     // Some Team/Enterprise orgs are billed on spend and report no rate-limit windows.
                     Text("No rate-limit windows reported for this org")
                         .font(.caption)
@@ -2247,23 +2259,18 @@ struct UsageView: View {
         }
     }
 
-    // Usage credits (pay-as-you-go). Only shown once credits are actually used.
+    // Extra usage (pay-as-you-go). On Team/Enterprise there are two numbers: the signed-in
+    // member's own spend against their cap, and the budget shared by the whole org.
     @ViewBuilder
     func extraUsageSection(_ org: OrgUsage) -> some View {
-        if org.hasCreditUsage || org.freeCreditsMinor > 0 {
-            let spentMinor = org.extraSpentMinor
-            let limitMinor = org.extraLimitMinor
-            let pct = limitMinor > 0 ? Double(spentMinor) / Double(limitMinor) : 0
-            let pctInt = Int((pct * 100).rounded())
-            // Show the exact % up to the limit; once over, just say "over limit".
-            let pctLabel = pctInt > 100 ? "over limit" : "\(pctInt)%"
+        if org.hasMemberSpend || org.hasCreditUsage || org.freeCreditsMinor > 0 {
             let fmt: (Int) -> String = { minor in
                 let v = Double(minor) / 100.0
                 return org.currency == "USD"
                     ? String(format: "$%.2f", v)
                     : "\(org.currency) " + String(format: "%.2f", v)
             }
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Text("Extra usage")
                         .font(.subheadline)
@@ -2280,25 +2287,13 @@ struct UsageView: View {
                     .buttonStyle(.borderless)
                 }
 
+                if org.hasMemberSpend {
+                    spendRow("Your usage", spent: org.memberSpentMinor, limit: org.memberLimitMinor,
+                             resets: nil, fmt: fmt)
+                }
                 if org.hasCreditUsage {
-                    if limitMinor > 0 {
-                        UsageBar(value: min(pct, 1.0), color: colorForPercentage(pct))
-                    }
-                    HStack {
-                        Text(limitMinor > 0
-                             ? "\(fmt(spentMinor)) of \(fmt(limitMinor)) · \(pctLabel)"
-                             : "\(fmt(spentMinor)) spent")
-                            .font(.caption)
-                            .foregroundColor(Color.secondaryText)
-                        Spacer()
-                        if let d = org.extraResetsAt {
-                            let f = DateFormatter()
-                            let _ = f.dateFormat = "MMM d"
-                            Text("Resets \(f.string(from: d))")
-                                .font(.caption)
-                                .foregroundColor(Color.secondaryText)
-                        }
-                    }
+                    spendRow(org.hasMemberSpend ? "Org budget (shared)" : nil, spent: org.extraSpentMinor,
+                             limit: org.extraLimitMinor, resets: org.extraResetsAt, fmt: fmt)
                 }
 
                 if org.freeCreditsMinor > 0 {
@@ -2306,6 +2301,40 @@ struct UsageView: View {
                         .font(.caption2)
                         .foregroundColor(Color.secondaryText)
                         .opacity(0.85)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    func spendRow(_ title: String?, spent: Int, limit: Int, resets: Date?,
+                  fmt: @escaping (Int) -> String) -> some View {
+        let pct = limit > 0 ? Double(spent) / Double(limit) : 0
+        let pctInt = Int((pct * 100).rounded())
+        // Show the exact % up to the limit; once over, just say "over limit".
+        let pctLabel = pctInt > 100 ? "over limit" : "\(pctInt)%"
+        VStack(alignment: .leading, spacing: 4) {
+            if let title = title {
+                Text(title)
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(Color.secondaryText)
+            }
+            if limit > 0 {
+                UsageBar(value: min(pct, 1.0), color: colorForPercentage(pct))
+            }
+            HStack {
+                Text(limit > 0
+                     ? "\(fmt(spent)) of \(fmt(limit)) · \(pctLabel)"
+                     : "\(fmt(spent)) spent")
+                    .font(.caption)
+                    .foregroundColor(Color.secondaryText)
+                Spacer()
+                if let d = resets {
+                    let f = DateFormatter()
+                    let _ = f.dateFormat = "MMM d"
+                    Text("Resets \(f.string(from: d))")
+                        .font(.caption)
+                        .foregroundColor(Color.secondaryText)
                 }
             }
         }
