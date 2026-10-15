@@ -170,9 +170,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func setupKeyboardShortcut() {
-        // Check Accessibility permissions
-        checkAccessibilityPermissions()
-
         // Only register if user has the shortcut enabled
         if usageManager.shortcutEnabled {
             registerGlobalHotKey()
@@ -184,32 +181,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             registerGlobalHotKey()
         } else {
             unregisterGlobalHotKey()
-        }
-    }
-
-    func checkAccessibilityPermissions() {
-        // Check if app has Accessibility permissions
-        let trusted = AXIsProcessTrusted()
-
-        if !trusted {
-            NSLog("⚠️ Accessibility permissions not granted")
-            // Show alert to guide user
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                let alert = NSAlert()
-                alert.messageText = "Accessibility Permission Required"
-                alert.informativeText = "ClaudeUsageBar needs Accessibility permission to use the Cmd+U keyboard shortcut.\n\nPlease enable it in:\nSystem Settings → Privacy & Security → Accessibility"
-                alert.alertStyle = .informational
-                alert.addButton(withTitle: "Open System Settings")
-                alert.addButton(withTitle: "Skip for Now")
-
-                let response = alert.runModal()
-                if response == .alertFirstButtonReturn {
-                    // Open System Settings
-                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-                }
-            }
-        } else {
-            NSLog("✅ Accessibility permissions granted")
         }
     }
 
@@ -505,7 +476,6 @@ class UsageManager: ObservableObject {
     @Published var hasWeeklySonnet: Bool = false
     @Published var hasWeeklyFable: Bool = false
     @Published var hasFetchedData: Bool = false
-    @Published var isAccessibilityEnabled: Bool = false
     @Published var shortcutEnabled: Bool = true
 
     private var statusItem: NSStatusItem?
@@ -518,11 +488,6 @@ class UsageManager: ObservableObject {
         self.delegate = delegate
         loadSessionCookie()
         loadSettings()
-        checkAccessibilityStatus()
-    }
-
-    func checkAccessibilityStatus() {
-        isAccessibilityEnabled = AXIsProcessTrusted()
     }
 
     func loadSessionCookie() {
@@ -2129,19 +2094,6 @@ struct UsageView: View {
                             }
                         }
                         .toggleStyle(.switch)
-
-                        if usageManager.shortcutEnabled && !usageManager.isAccessibilityEnabled {
-                            Button("Grant Accessibility Permission") {
-                                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.small)
-
-                            Text("Accessibility permission may be needed\nfor the shortcut to work in all apps")
-                                .font(.caption2)
-                                .foregroundColor(Color.secondaryText)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
                     }
 
                     Divider()
