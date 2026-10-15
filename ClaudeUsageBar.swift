@@ -68,15 +68,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         updateManager = UpdateManager()
 
         // Create popover
-        popover = NSPopover()
-        // Initial guess; SwiftUI's intrinsic size (capped at 600) will drive the actual size.
-        popover.contentSize = NSSize(width: 360, height: 320)
-        popover.behavior = .transient
-        popover.contentViewController = NSHostingController(rootView: UsageView(
-            usageManager: usageManager,
-            statusManager: statusManager,
-            updateManager: updateManager
-        ))
+        popover = makePopover()
+
+        // After sleep/wake or a display change the status-item window can move while a
+        // long-lived popover keeps its old anchor geometry (top half ends up off-screen).
+        // Close it before sleep and rebuild it fresh on wake / screen changes.
+        let ws = NSWorkspace.shared.notificationCenter
+        ws.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.closePopover()
+        }
+        ws.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.rebuildPopover()
+        }
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.rebuildPopover()
+        }
 
         // Appearance preference: "system" (default) tracks the macOS light/dark
         // setting; "dark"/"light" force one (dark was hard-forced in v1.3.2 and
@@ -114,6 +122,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Set up Cmd+U keyboard shortcut
         setupKeyboardShortcut()
+    }
+
+    func makePopover() -> NSPopover {
+        let p = NSPopover()
+        // Initial guess; SwiftUI's intrinsic size (capped at 600) will drive the actual size.
+        p.contentSize = NSSize(width: 360, height: 320)
+        p.behavior = .transient
+        p.contentViewController = NSHostingController(rootView: UsageView(
+            usageManager: usageManager,
+            statusManager: statusManager,
+            updateManager: updateManager
+        ))
+        return p
+    }
+
+    func rebuildPopover() {
+        closePopover()
+        popover = makePopover()
+        applyAppearancePreference()
     }
 
     func applyAppearancePreference() {
@@ -620,6 +647,50 @@ class UsageManager: ObservableObject {
         return request
     }
 
+    // MARK: - Diagnostics (off unless `defaults write com.claude.usagebar debug_dump_shapes -bool true`)
+
+    private static let dumpQueue = DispatchQueue(label: "usagebar.dump")
+
+    /// Structure-only rendering of a JSON value: keys and types, numbers/bools as-is,
+    /// ids/emails/long strings redacted.
+    static func shape(_ v: Any, depth: Int = 0) -> String {
+        switch v {
+        case let d as [String: Any]:
+            if depth > 6 { return "{…}" }
+            return "{" + d.keys.sorted().map { "\($0): \(shape(d[$0]!, depth: depth + 1))" }.joined(separator: ", ") + "}"
+        case let a as [Any]:
+            return "[\(a.count)×" + (a.first.map { shape($0, depth: depth + 1) } ?? "") + "]"
+        case let n as NSNumber:
+            return CFGetTypeID(n) == CFBooleanGetTypeID() ? "\(n.boolValue)" : "\(n)"
+        case let s as String:
+            let uuid = s.range(of: "^[0-9a-fA-F]{8}-[0-9a-fA-F-]{27}$", options: .regularExpression) != nil
+            if uuid || s.contains("@") { return "<id>" }
+            return s.count > 40 ? "<str>" : "\"\(s)\""
+        case is NSNull:
+            return "null"
+        default:
+            return "?"
+        }
+    }
+
+    static func dumpShape(path: String, status: Int?, data: Data?) {
+        let redactedPath = path.replacingOccurrences(
+            of: "[0-9a-fA-F]{8}-[0-9a-fA-F-]{27}", with: "<org>", options: .regularExpression)
+        var line = "\(redactedPath) -> HTTP \(status ?? -1)\n"
+        if let data = data, let json = try? JSONSerialization.jsonObject(with: data) {
+            line += "  " + shape(json) + "\n"
+        }
+        dumpQueue.async {
+            let url = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Logs/ClaudeUsageBar-shapes.txt")
+            if let h = try? FileHandle(forWritingTo: url) {
+                h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close()
+            } else {
+                try? line.write(to: url, atomically: true, encoding: .utf8)
+            }
+        }
+    }
+
     /// GET a claude.ai API path; completes on an arbitrary queue with (HTTP status, raw body).
     /// Status is nil on a transport error.
     private func getJSON(_ path: String, completion: @escaping (Int?, Data?) -> Void) {
@@ -635,6 +706,9 @@ class UsageManager: ObservableObject {
             }
             let status = (response as? HTTPURLResponse)?.statusCode
             NSLog("📡 \(path): HTTP \(status ?? -1)")
+            if UserDefaults.standard.bool(forKey: "debug_dump_shapes") {
+                Self.dumpShape(path: path, status: status, data: data)
+            }
             completion(status, data)
         }.resume()
     }
@@ -680,6 +754,12 @@ class UsageManager: ObservableObject {
 
         isLoading = true
         errorMessage = nil
+
+        if UserDefaults.standard.bool(forKey: "debug_dump_shapes") {
+            let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/ClaudeUsageBar-shapes.txt")
+            try? FileManager.default.removeItem(at: url)
+            getJSON("bootstrap") { _, _ in }
+        }
 
         fetchOrganizations { [weak self] infos in
             guard let self = self else { return }
