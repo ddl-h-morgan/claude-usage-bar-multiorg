@@ -1,0 +1,32 @@
+name: build
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build universal app bundle (ad-hoc signed)
+        run: |
+          set -euo pipefail
+          APP=build/ClaudeUsageBar.app
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp Info.plist "$APP/Contents/"
+          cp ClaudeUsageBar.icns "$APP/Contents/Resources/"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string ClaudeUsageBar" "$APP/Contents/Info.plist" || true
+          for arch in arm64 x86_64; do
+            swiftc -parse-as-library -o "build/bin_$arch" ClaudeUsageBar.swift \
+              -framework SwiftUI -framework AppKit -framework WebKit \
+              -target "$arch-apple-macos12.0"
+          done
+          lipo -create -output "$APP/Contents/MacOS/ClaudeUsageBar" build/bin_arm64 build/bin_x86_64
+          echo -n "APPL????" > "$APP/Contents/PkgInfo"
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --verbose=2 "$APP"
+          ditto -c -k --keepParent "$APP" build/ClaudeUsageBar.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ClaudeUsageBar-app
+          path: build/ClaudeUsageBar.zip
