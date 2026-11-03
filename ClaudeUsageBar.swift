@@ -14,11 +14,82 @@ extension Color {
     })
 }
 
+/// Compact choice control with the accent-blue selection of the app's prominent
+/// buttons. Native segmented pickers only tint while their window is key, which
+/// the popover never is, so they read as flat gray.
+struct ChoicePills: View {
+    @Binding var selection: String
+    let options: [(label: String, tag: String)]
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(options, id: \.tag) { option in
+                let selected = selection == option.tag
+                Button(action: { selection = option.tag }) {
+                    Text(option.label)
+                        .font(.caption)
+                        .fontWeight(selected ? .semibold : .regular)
+                        .foregroundColor(selected ? .white : Color.secondaryText)
+                        .frame(minWidth: 64)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(RoundedRectangle(cornerRadius: 5).fill(selected ? Color.accentColor : Color.clear))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(2)
+        .background(RoundedRectangle(cornerRadius: 7).fill(Color.secondary.opacity(0.15)))
+        .fixedSize()
+    }
+}
+
+/// A banked limit reset the user can trigger (Claude grant or Codex reset credit).
+struct ResetGrant: Equatable {
+    let title: String
+    let count: Int
+    let expiresAt: Date?
+}
+
+/// Banked resets as a plain line: count on the left, expiry aligned right.
+struct ResetRow: View {
+    let title: String
+    let detail: String?
+    let help: String
+
+    var body: some View {
+        HStack {
+            Text(title)
+            Spacer()
+            if let detail = detail {
+                Text(detail)
+            }
+        }
+        .font(.caption)
+        .foregroundColor(Color.secondaryText)
+        .help(help)
+    }
+}
+
+// Where usage "should" sit right now, given how far into the reset window we
+// are. Built by the view layer from a Pace; the two fields travel together so a
+// tick can never be drawn without the tooltip explaining it.
+struct PaceMarker {
+    let expected: Double   // 0...1
+    let tooltip: String
+}
+
 // Deterministic usage bar: the native linear ProgressView ignores .tint() in
 // light (aqua) and vibrant rendering and falls back to accent blue.
 struct UsageBar: View {
     let value: Double
     let color: Color
+    var pace: PaceMarker? = nil
+
+    @State private var isHovering = false
+
+    private let tickWidth: CGFloat = 1.5
 
     var body: some View {
         GeometryReader { geo in
@@ -27,9 +98,65 @@ struct UsageBar: View {
                 Capsule()
                     .fill(color)
                     .frame(width: max(0, min(1, value)) * geo.size.width)
+                // Pace tick. Neutral rather than coloured so it stays legible over
+                // both the saturated fill and the faint track, in either
+                // appearance, without competing with the green/orange/red.
+                if let pace = pace {
+                    Rectangle()
+                        .fill(Color.primary.opacity(0.7))
+                        .frame(width: tickWidth)
+                        .offset(x: max(0, min(1, pace.expected)) * geo.size.width - tickWidth / 2)
+                }
+            }
+            // Trims a tick near either end against the rounded cap instead of
+            // letting it poke out past the bar.
+            .clipShape(Capsule())
+            // Drawn after the clip so the bubble isn't trimmed to the capsule, and
+            // anchored to the bar's leading edge rather than centred on the tick:
+            // the popup is only 360pt wide, so a bubble that tracks the tick runs
+            // off the right-hand side.
+            .overlay(alignment: .topLeading) {
+                if let pace = pace, isHovering {
+                    PaceTooltip(text: pace.tooltip)
+                        .offset(y: -24)
+                }
             }
         }
         .frame(height: 6)
+        // Hover, not .help(): the popover is never the key window (nothing calls
+        // NSApp.activate) and AppKit tooltips don't fire in an inactive one — the
+        // same reason PasteableNSTextView implements Cmd-V by hand. Tracked on the
+        // whole bar, since a 1.5pt tick is nothing to aim at.
+        .onHover { isHovering = $0 }
+    }
+}
+
+// Tooltip bubble for the pace marker.
+//
+// Solid backing rather than a material: over the popover's own translucent
+// backing a material reads as muddy. Sized to its text, which is safe because
+// the string is bounded — at its longest, "On pace: 100% by now · 6d 23h in"
+// still sits comfortably inside the bar.
+struct PaceTooltip: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.caption2)
+            .foregroundColor(Color.primary)
+            .fixedSize()
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background(
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(Color(nsColor: .controlBackgroundColor))
+                    .shadow(color: .black.opacity(0.28), radius: 3, y: 1)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 5)
+                    .stroke(Color.primary.opacity(0.12), lineWidth: 0.5)
+            )
+            .allowsHitTesting(false)
     }
 }
 
@@ -433,10 +560,14 @@ struct OrgUsage: Equatable {
     var extraResetsAt: Date?
     var freeCreditsMinor = 0
     var currency = "USD"
-    var limitResetsLeft = 0
-    var limitResetsEndAt: Date?
+    var limitResetGrants: [ResetGrant] = []
+    // Dollar allowance claude.ai calls `iguana_necktie`; limit 0 when the org doesn't have it.
+    var sessionCreditsUsed = 0.0
+    var sessionCreditsLimit = 0.0
+    var sessionCreditsResetsAt: Date?
     var error: String?
 
+    var limitResetsLeft: Int { limitResetGrants.reduce(0) { $0 + $1.count } }
     var hasCreditUsage: Bool { extraSpentMinor > 0 }
     var hasMemberSpend: Bool { memberSpentMinor > 0 || memberLimitMinor > 0 }
     var hasAnyWindow: Bool { session != nil || weekly != nil || weeklySonnet != nil || weeklyFable != nil }
@@ -460,9 +591,14 @@ class UsageManager: ObservableObject {
     // Banked usage-limit resets the user can trigger on claude.ai (e.g. the Opus 5.5
     // launch grant). Read-only here: using one is a POST on /reset_rate_limits.
     @Published var limitResetsLeft: Int = 0
-    @Published var limitResetsEndAt: Date?
+    @Published var limitResetGrants: [ResetGrant] = []
     @Published var creditCurrency: String = "USD"
     @Published var hasCreditUsage: Bool = false
+    // Dollar allowance claude.ai calls `iguana_necktie` (e.g. $250, renews monthly).
+    // nil when the account doesn't have it: the row is hidden entirely.
+    @Published var sessionCreditsUsed: Double = 0
+    @Published var sessionCreditsLimit: Double = 0
+    @Published var sessionCreditsResetsAt: Date?
     @Published var sessionResetsAt: Date?
     @Published var weeklyResetsAt: Date?
     @Published var weeklySonnetResetsAt: Date?
@@ -477,6 +613,7 @@ class UsageManager: ObservableObject {
     @Published var hasWeeklyFable: Bool = false
     @Published var hasFetchedData: Bool = false
     @Published var shortcutEnabled: Bool = true
+    @Published var paceMarkerEnabled: Bool = false
 
     private var statusItem: NSStatusItem?
     private var sessionCookie: String = ""
@@ -533,6 +670,9 @@ class UsageManager: ObservableObject {
         } else {
             shortcutEnabled = UserDefaults.standard.bool(forKey: "shortcut_enabled")
         }
+        // Off unless switched on: an upgrade shouldn't change how the bars look
+        // without being asked. bool(forKey:) already returns false when unset.
+        paceMarkerEnabled = UserDefaults.standard.bool(forKey: "pace_marker_enabled")
     }
 
     func saveSettings() {
@@ -540,6 +680,7 @@ class UsageManager: ObservableObject {
         UserDefaults.standard.set(statusNotificationsEnabled, forKey: "status_notifications_enabled")
         UserDefaults.standard.set(openAtLogin, forKey: "open_at_login")
         UserDefaults.standard.set(shortcutEnabled, forKey: "shortcut_enabled")
+        UserDefaults.standard.set(paceMarkerEnabled, forKey: "pace_marker_enabled")
         UserDefaults.standard.synchronize()
     }
 
@@ -591,7 +732,10 @@ class UsageManager: ObservableObject {
         extraResetsAt = nil
         freeCreditsMinor = 0
         limitResetsLeft = 0
-        limitResetsEndAt = nil
+        limitResetGrants = []
+        sessionCreditsLimit = 0
+        sessionCreditsUsed = 0
+        sessionCreditsResetsAt = nil
         hasCreditUsage = false
         hasFetchedData = false
         hasWeeklySonnet = false
@@ -812,7 +956,7 @@ class UsageManager: ObservableObject {
             lock.lock(); defer { lock.unlock(); group.leave() }
             guard status == 200, let data = data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-            (usage.limitResetsLeft, usage.limitResetsEndAt) = Self.parseLimitResets(json["cedar_ember"])
+            usage.limitResetGrants = Self.parseLimitResets(json["cedar_ember"])
         }
 
         group.notify(queue: .global()) { completion(usage) }
@@ -862,6 +1006,15 @@ class UsageManager: ObservableObject {
         usage.session = window(json["five_hour"])
         usage.weekly = window(json["seven_day"])
         usage.weeklySonnet = window(json["seven_day_sonnet"])
+        usage.sessionCreditsUsed = 0
+        usage.sessionCreditsLimit = 0
+        usage.sessionCreditsResetsAt = nil
+        if let credits = json["iguana_necktie"] as? [String: Any],
+           let limit = (credits["limit_dollars"] as? NSNumber)?.doubleValue, limit > 0 {
+            usage.sessionCreditsLimit = limit
+            usage.sessionCreditsUsed = (credits["used_dollars"] as? NSNumber)?.doubleValue ?? 0
+            usage.sessionCreditsResetsAt = parseDate(credits["resets_at"])
+        }
         usage.weeklyFable = nil
         usage.memberSpentMinor = 0
         usage.memberLimitMinor = 0
@@ -902,23 +1055,20 @@ class UsageManager: ObservableObject {
         if let cur = json["currency"] as? String { usage.currency = cur }
     }
 
-    /// Counts resets still usable across grants (not paused, inside their window)
-    /// and returns the earliest end date among them.
-    static func parseLimitResets(_ raw: Any?, now: Date = Date()) -> (Int, Date?) {
+    /// Grants with resets still usable (not paused, inside their window).
+    static func parseLimitResets(_ raw: Any?, now: Date = Date()) -> [ResetGrant] {
         guard let obj = raw as? [String: Any],
               (obj["eligible"] as? Bool) == true,
-              let grants = obj["grants"] as? [[String: Any]] else { return (0, nil) }
-        var total = 0
-        var earliestEnd: Date?
+              let grants = obj["grants"] as? [[String: Any]] else { return [] }
+        var out: [ResetGrant] = []
         for g in grants {
             let left = (g["resets_left"] as? Int) ?? 0
             guard left > 0, (g["paused"] as? Bool) != true,
                   let end = parseDate(g["ends_at"]), end > now else { continue }
             if let start = parseDate(g["starts_at"]), start > now { continue }
-            total += left
-            earliestEnd = min(earliestEnd ?? end, end)
+            out.append(ResetGrant(title: (g["label"] as? String) ?? "Usage-limit reset", count: left, expiresAt: end))
         }
-        return (total, earliestEnd)
+        return out
     }
 
     /// Mirrors the busiest org into the legacy single-value fields that drive the
@@ -1011,6 +1161,36 @@ class UsageManager: ObservableObject {
         weeklyPercentage = Double(weeklyUsage) / Double(weeklyLimit)
         weeklySonnetPercentage = Double(weeklySonnetUsage) / Double(weeklySonnetLimit)
         weeklyFablePercentage = Double(weeklyFableUsage) / Double(weeklyFableLimit)
+    }
+}
+
+// MARK: - Pace
+
+// Fixed window lengths per limit type. Flat seconds, not calendar units:
+// resets_at is an absolute server timestamp, so subtracting 7*24h stays correct
+// across a DST boundary where a calendar "7 days" would land an hour off.
+enum PaceWindow {
+    static let session: TimeInterval = 5 * 3600
+    static let weekly: TimeInterval = 7 * 24 * 3600
+}
+
+struct Pace {
+    let expected: Double      // 0...1 — where the fill "should" be by now
+    let elapsed: TimeInterval
+
+    // The API reports only resets_at, never the window start — but since the
+    // window length is fixed by limit type, the start is derived exactly rather
+    // than estimated.
+    //
+    // Fails whenever there's nothing honest to draw: no data yet, the reset is
+    // already due (stale fetch — a marker pinned at 100% would assert something
+    // false), or the clock sits before the window even opened.
+    init?(resetsAt: Date?, window: TimeInterval, now: Date = Date()) {
+        guard let resetsAt = resetsAt, window > 0, now < resetsAt else { return nil }
+        let elapsed = now.timeIntervalSince(resetsAt.addingTimeInterval(-window))
+        guard elapsed >= 0 else { return nil }
+        self.expected = min(1, max(0, elapsed / window))
+        self.elapsed = elapsed
     }
 }
 
@@ -1613,6 +1793,9 @@ struct UsageView: View {
     @State private var measuredHeight: CGFloat = 250
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage("appearance_mode") private var appearanceMode: String = "system"
+    @AppStorage("reset_time_style") private var resetTimeStyle: String = "countdown"
+    @State private var now = Date()
+    private let minuteTicker = Timer.publish(every: 60, on: .main, in: .common).autoconnect()
 
     private let maxPopupHeight: CGFloat = 600
 
@@ -1642,7 +1825,9 @@ struct UsageView: View {
                 guard value > 0 else { return }
                 measuredHeight = value
             }
+            .onReceive(minuteTicker) { now = $0 }
             .onAppear {
+                now = Date()
                 if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
                     sessionCookieInput = String(savedCookie.prefix(20)) + "..."
                 }
@@ -2073,6 +2258,18 @@ struct UsageView: View {
 
                     Divider()
 
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Reset times")
+                            .font(.caption)
+                        ChoicePills(selection: $resetTimeStyle,
+                                    options: [("Time left", "countdown"), ("Date", "date")])
+                        Text("Show reset times as time left or as a date")
+                            .font(.caption2)
+                            .foregroundColor(Color.secondaryText)
+                    }
+
+                    Divider()
+
                     VStack(alignment: .leading, spacing: 8) {
                         Toggle(isOn: Binding(
                             get: { usageManager.shortcutEnabled },
@@ -2120,18 +2317,33 @@ struct UsageView: View {
 
                     Divider()
 
+                    Toggle(isOn: Binding(
+                        get: { usageManager.paceMarkerEnabled },
+                        set: { newValue in
+                            usageManager.paceMarkerEnabled = newValue
+                            usageManager.saveSettings()
+                        }
+                    )) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Show Pace Marker")
+                                .font(.caption)
+                            Text("Mark where usage should be by now, based on how far into the reset window you are")
+                                .font(.caption2)
+                                .foregroundColor(Color.secondaryText)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .toggleStyle(.checkbox)
+
+                    Divider()
+
                     // Appearance sits last on purpose: opening Settings auto-scrolls
                     // to the anchor below, so this lands in view.
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Appearance")
                             .font(.caption)
-                        Picker("Appearance", selection: $appearanceMode) {
-                            Text("System").tag("system")
-                            Text("Dark").tag("dark")
-                            Text("Light").tag("light")
-                        }
-                        .pickerStyle(.segmented)
-                        .labelsHidden()
+                        ChoicePills(selection: $appearanceMode,
+                                    options: [("System", "system"), ("Dark", "dark"), ("Light", "light")])
                         .onChange(of: appearanceMode) { _ in
                             (NSApplication.shared.delegate as? AppDelegate)?.applyAppearancePreference()
                         }
@@ -2154,19 +2366,20 @@ struct UsageView: View {
     }
 
     @ViewBuilder
-    func usageRow(_ title: String, _ w: UsageWindow, includeDate: Bool) -> some View {
+    func usageRow(_ title: String, _ w: UsageWindow, includeDate: Bool, window: TimeInterval) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Text(title)
                     .font(.subheadline)
                 Spacer()
                 if let resetTime = w.resetsAt {
-                    Text("Resets \(formatResetTime(resetTime, includeDate: includeDate))")
+                    Text(resetText(resetTime, includeDate: includeDate)).help(resetHelp(resetTime, includeDate: includeDate))
                         .font(.caption)
                         .foregroundColor(Color.secondaryText)
                 }
             }
-            UsageBar(value: w.fraction, color: colorForPercentage(w.fraction))
+            UsageBar(value: w.fraction, color: colorForPercentage(w.fraction),
+                     pace: paceMarker(resetsAt: w.resetsAt, window: window))
             Text("\(w.percent)% used")
                 .font(.caption)
                 .foregroundColor(Color.secondaryText)
@@ -2186,11 +2399,11 @@ struct UsageView: View {
                     .font(.caption)
                     .foregroundColor(.orange)
             } else {
-                if let w = org.session { usageRow("Session (5 hour)", w, includeDate: false) }
-                if let w = org.weekly { usageRow("Weekly (7 day)", w, includeDate: true) }
-                if let w = org.weeklySonnet { usageRow("Weekly Sonnet (7 day)", w, includeDate: true) }
+                if let w = org.session { usageRow("Session (5 hour)", w, includeDate: false, window: PaceWindow.session) }
+                if let w = org.weekly { usageRow("Weekly (7 day)", w, includeDate: true, window: PaceWindow.weekly) }
+                if let w = org.weeklySonnet { usageRow("Weekly Sonnet (7 day)", w, includeDate: true, window: PaceWindow.weekly) }
                 // Fable is only surfaced once usage is above 1% (new model, counted separately).
-                if let w = org.weeklyFable, w.percent >= 1 { usageRow("Weekly Fable (7 day)", w, includeDate: true) }
+                if let w = org.weeklyFable, w.percent >= 1 { usageRow("Weekly Fable (7 day)", w, includeDate: true, window: PaceWindow.weekly) }
 
                 if !org.hasAnyWindow && !org.hasMemberSpend && !org.hasCreditUsage && org.freeCreditsMinor == 0 {
                     // Some Team/Enterprise orgs are billed on spend and report no rate-limit windows.
@@ -2199,19 +2412,36 @@ struct UsageView: View {
                         .foregroundColor(Color.secondaryText)
                 }
 
+                // Claude session credits: shown from the first cent used; hidden while
+                // untouched or when the org has no allowance.
+                if org.sessionCreditsLimit > 0, org.sessionCreditsUsed >= 0.01 {
+                    let used = org.sessionCreditsUsed
+                    let limit = org.sessionCreditsLimit
+                    let money: (Double) -> String = { v in
+                        v == v.rounded() ? String(format: "$%.0f", v) : String(format: "$%.2f", v)
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text("Claude session credits")
+                                .font(.subheadline)
+                            Spacer()
+                            if let resetTime = org.sessionCreditsResetsAt {
+                                Text(resetText(resetTime)).help(resetHelp(resetTime))
+                                    .font(.caption)
+                                    .foregroundColor(Color.secondaryText)
+                            }
+                        }
+                        UsageBar(value: used / limit, color: colorForPercentage(used / limit))
+                        Text("\(money(max(0, limit - used))) of \(money(limit)) left")
+                            .font(.caption)
+                            .foregroundColor(Color.secondaryText)
+                    }
+                }
+
                 extraUsageSection(org)
 
                 if org.limitResetsLeft > 0 {
-                    let n = org.limitResetsLeft
-                    let until: String = org.limitResetsEndAt.map { d in
-                        // Last usable instant: an end at local midnight would read as the next day.
-                        let f = DateFormatter(); f.dateFormat = "MMM d"
-                        return " until \(f.string(from: d.addingTimeInterval(-1)))"
-                    } ?? ""
-                    Text("\(n) usage-limit reset\(n == 1 ? "" : "s") available\(until)")
-                        .font(.caption2)
-                        .foregroundColor(Color.secondaryText)
-                        .opacity(0.6)
+                    resetRow(org.limitResetGrants)
                 }
             }
         }
@@ -2310,6 +2540,61 @@ struct UsageView: View {
         return formatter.string(from: date)
     }
 
+    /// "5d 23h", "3h 12m" or "12m"; minutes round up so it never reads "0m" early.
+    static func countdown(to date: Date, from now: Date) -> String {
+        let mins = Int((date.timeIntervalSince(now) / 60).rounded(.up))
+        let d = mins / 1440, h = (mins % 1440) / 60, m = mins % 60
+        if d > 0 { return "\(d)d \(h)h" }
+        if h > 0 { return "\(h)h \(m)m" }
+        return "\(m)m"
+    }
+
+    private func timeLeft(_ date: Date) -> String {
+        date <= now ? "now" : "in \(Self.countdown(to: date, from: now))"
+    }
+
+    /// Reset label, as time left or as a date per Settings > Reset times.
+    /// `includeDate: false` (5-hour session) shows just the clock time in date mode.
+    func resetText(_ date: Date, includeDate: Bool = true) -> String {
+        resetTimeStyle == "date" ? "Resets \(formatResetTime(date, includeDate: includeDate))" : "Resets \(timeLeft(date))"
+    }
+
+    /// The other format, on hover.
+    func resetHelp(_ date: Date, includeDate: Bool = true) -> String {
+        resetTimeStyle == "date" ? "Resets \(timeLeft(date))" : "Resets \(formatResetTime(date, includeDate: includeDate))"
+    }
+
+    /// Right side of the reset chip: "Expires in 6d 4h" or "Until Oct 22". With several
+    /// resets expiring on different days, the soonest one is what matters ("Next ...").
+    func resetsExpiryText(_ grants: [ResetGrant]) -> String? {
+        let ends = grants.compactMap { $0.expiresAt }
+        guard let first = ends.min() else { return nil }
+        let next = Set(ends).count > 1 ? "Next " : ""
+        if resetTimeStyle == "date" {
+            // Last usable instant: an end at local midnight would read as the next day.
+            let f = DateFormatter(); f.dateFormat = "MMM d"
+            let day = f.string(from: first.addingTimeInterval(-1))
+            return next.isEmpty ? "Until \(day)" : "Next until \(day)"
+        }
+        return next.isEmpty ? "Expires \(timeLeft(first))" : "Next expires \(timeLeft(first))"
+    }
+
+    func resetRow(_ grants: [ResetGrant]) -> some View {
+        let n = grants.reduce(0) { $0 + $1.count }
+        return ResetRow(title: "\(n) limit reset\(n == 1 ? "" : "s") available",
+                         detail: resetsExpiryText(grants),
+                         help: resetsHelp(grants))
+    }
+
+    func resetsHelp(_ grants: [ResetGrant]) -> String {
+        let f = DateFormatter(); f.dateFormat = "MMM d, h:mm a"
+        return grants.sorted { ($0.expiresAt ?? .distantFuture) < ($1.expiresAt ?? .distantFuture) }.map { g in
+            let count = g.count > 1 ? " (x\(g.count))" : ""
+            let when = g.expiresAt.map { "expires \(f.string(from: $0))" } ?? "no expiry"
+            return "\(g.title)\(count): \(when)"
+        }.joined(separator: "\n")
+    }
+
     func formatResetTime(_ date: Date, includeDate: Bool = false) -> String {
         let formatter = DateFormatter()
 
@@ -2322,6 +2607,31 @@ struct UsageView: View {
             formatter.dateStyle = .none
             return "at \(formatter.string(from: date))"
         }
+    }
+
+    // nil whenever no honest marker can be drawn: the setting is off, or the
+    // window data can't support one (see Pace.init).
+    //
+    // The row label already names the window ("Weekly (7 day)"), so the tooltip
+    // doesn't repeat it — a longer string overflows the 360pt popup.
+    func paceMarker(resetsAt: Date?, window: TimeInterval) -> PaceMarker? {
+        guard usageManager.paceMarkerEnabled,
+              let pace = Pace(resetsAt: resetsAt, window: window) else { return nil }
+        let percent = Int((pace.expected * 100).rounded())
+        return PaceMarker(
+            expected: pace.expected,
+            tooltip: "On pace: \(percent)% by now · \(formatElapsed(pace.elapsed)) in"
+        )
+    }
+
+    func formatElapsed(_ interval: TimeInterval) -> String {
+        let totalMinutes = max(0, Int(interval / 60))
+        let days = totalMinutes / 1440
+        let hours = (totalMinutes % 1440) / 60
+        let minutes = totalMinutes % 60
+        if days > 0 { return "\(days)d \(hours)h" }
+        if hours > 0 { return "\(hours)h \(minutes)m" }
+        return "\(minutes)m"
     }
 
     func colorForPercentage(_ percentage: Double) -> Color {
